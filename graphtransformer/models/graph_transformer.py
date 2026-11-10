@@ -16,7 +16,8 @@ reads), instead of against one averaged user vector.
 
 Inductive: a user is defined purely by their library, so new users need no
 retraining. Books combine an ID embedding (randomly dropped in training to simulate
-rarely-rated books) with content features (tags, author, language, year).
+rarely-rated books) with the shared content features from common/process.py (tags, author,
+series, language, year bucket, numeric).
 """
 from __future__ import annotations
 
@@ -35,14 +36,19 @@ class BookEncoder(nn.Module):
                  nbrs: torch.Tensor | None = None, n_graph_nbrs: int = 20):
         super().__init__()
         self.n_books, self.id_dropout = n_books, id_dropout
+        assert feats.tags.shape[0] == n_books, "features and interactions come from different runs"
         self.register_buffer("tags", torch.as_tensor(feats.tags, dtype=torch.float32))
+        self.register_buffer("numeric", torch.as_tensor(feats.numeric, dtype=torch.float32))
         self.register_buffer("author", torch.as_tensor(feats.author))
+        self.register_buffer("series", torch.as_tensor(feats.series))
         self.register_buffer("language", torch.as_tensor(feats.language))
         self.register_buffer("year", torch.as_tensor(feats.year))
         self.id_emb = nn.Embedding(n_books, d)
         nn.init.normal_(self.id_emb.weight, std=0.02)
         self.tag_proj = nn.Linear(feats.tags.shape[1], d)
+        self.num_proj = nn.Linear(feats.numeric.shape[1], d) if feats.numeric.shape[1] else None
         self.author_emb = nn.Embedding(feats.n_authors, d)
+        self.series_emb = nn.Embedding(feats.n_series, d)
         self.lang_emb = nn.Embedding(feats.n_languages, d)
         self.year_emb = nn.Embedding(feats.n_year_buckets, d)
         self.norm = nn.LayerNorm(d)
@@ -56,7 +62,10 @@ class BookEncoder(nn.Module):
     def forward(self) -> torch.Tensor:
         """Embeddings for all books plus a zero padding row: [n_books + 1, d]."""
         content = (self.tag_proj(self.tags) + self.author_emb(self.author)
-                   + self.lang_emb(self.language) + self.year_emb(self.year))
+                   + self.series_emb(self.series) + self.lang_emb(self.language)
+                   + self.year_emb(self.year))
+        if self.num_proj is not None:
+            content = content + self.num_proj(self.numeric)
         ids = self.id_emb.weight
         if self.training and self.id_dropout > 0:
             keep = (torch.rand(self.n_books, 1, device=ids.device) >= self.id_dropout).float()

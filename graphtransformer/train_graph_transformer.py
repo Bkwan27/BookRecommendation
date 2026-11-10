@@ -1,7 +1,10 @@
 """Train the graph-transformer expert with BPR + hard negatives + auxiliary rating loss.
 
-    python -m bookrec.train_graph_transformer                       # full run
-    python -m bookrec.train_graph_transformer --max-users 3000 --epochs 2 --eval-users 500  # smoke test
+Prerequisite (once per machine, ~15s): python -m common.process
+
+    python -m graphtransformer.train_graph_transformer                                  # full run
+    python -m graphtransformer.train_graph_transformer --max-users 4000 --epochs 2 \
+        --eval-users 500 --test-users 500                                               # smoke test
 """
 from __future__ import annotations
 
@@ -14,8 +17,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .data import SPLIT_DIR, build_dataset, load_or_make_split, load_ratings, load_to_read
-from .evaluate import constant_baselines, evaluate, popularity_recall
+from common.process import DEFAULT_PROCESSED
+from .data import load_dataset
+from .evaluate import baselines, evaluate
 from .features import load_book_features
 from .losses import LossConfig, objective
 from .models.graph_transformer import GraphTransformerRecommender
@@ -35,9 +39,9 @@ def pick_device(name: str) -> torch.device:
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     a = p.add_argument
-    a("--split", default="temporal", choices=["temporal", "random"])
+    a("--processed-dir", default=str(DEFAULT_PROCESSED), help="output of `python -m common.process`")
     a("--seed", type=int, default=0)
-    a("--epochs", type=int, default=10)
+    a("--epochs", type=int, default=25)
     a("--batch-size", type=int, default=256)
     a("--lr", type=float, default=1e-3)
     a("--weight-decay", type=float, default=1e-4)
@@ -47,17 +51,19 @@ def parse_args(argv=None):
     a("--dropout", type=float, default=0.1)
     a("--id-dropout", type=float, default=0.1, help="prob. of dropping a book's ID embedding")
     a("--graph-nbrs", type=int, default=20, help="co-rated neighbours for book smoothing (0 = off)")
-    a("--max-context", type=int, default=128)
+    a("--max-context", type=int, default=160, help="160 = every user's full train history")
     a("--max-targets", type=int, default=32)
     a("--target-frac", type=float, default=0.2)
     a("--rand-neg", type=int, default=16)
     a("--max-hard-neg", type=int, default=8)
-    a("--hard-step", type=int, default=2, help="hard negatives added per epoch (PinSAGE curriculum)")
+    a("--hard-step", type=int, default=1, help="hard negatives added per epoch (PinSAGE curriculum)")
     a("--hard-rank", type=int, nargs=2, default=[10, 100])
-    a("--no-to-read", action="store_true", help="don't use to_read.csv as positives")
+    a("--to-read", action="store_true",
+      help="ABLATION ONLY: use to_read.csv as extra positives (off in the shared protocol: it is an "
+           "end-of-timeline snapshot and leaks the future)")
     a("--to-read-per-user", type=int, default=4)
     # loss
-    a("--pos-threshold", type=int, default=4)
+    a("--pos-threshold", type=int, default=4, help="must equal the threshold common.process used")
     a("--dislike-threshold", type=int, default=2)
     a("--w-dislike", type=float, default=1.0)
     a("--w-graded", type=float, default=0.5)
@@ -84,18 +90,19 @@ def main(argv=None):
     print(f"device={device}")
 
     t0 = time.time()
-    r = load_ratings()
-    split = load_or_make_split(r, mode=args.split, seed=args.seed)
-    ds = build_dataset(r, split, None if args.no_to_read else load_to_read())
-    feats = load_book_features()
+    ds = load_dataset(args.processed_dir, use_to_read=args.to_read)
+    if args.pos_threshold != ds.positive_threshold:
+        raise SystemExit(f"--pos-threshold {args.pos_threshold} != processed threshold {ds.positive_threshold}")
+    feats = load_book_features(args.processed_dir)
     need_k = max(args.hard_rank[1], args.graph_nbrs)
-    nbrs = corated_neighbors(ds.train, ds.n_books, k=need_k,
-                             cache=SPLIT_DIR / f"{args.split}_seed{args.seed}_nbrs{need_k}.npz")
-    print(f"data ready in {time.time() - t0:.0f}s: train={len(ds.train.book):,} "
+    nbrs = corated_neighbors(ds.train, ds.n_items, k=need_k,
+                             cache=Path(args.processed_dir) / "cache" / f"corated_{ds.fingerprint}_k{need_k}.npz")
+    print(f"data ready in {time.time() - t0:.0f}s (fingerprint {ds.fingerprint}): "
+          f"users={ds.n_users:,} books={ds.n_items:,} train={len(ds.train.book):,} "
           f"val={len(ds.val.book):,} test={len(ds.test.book):,}")
 
     model = GraphTransformerRecommender(
-        feats, ds.n_books, d=args.dim, heads=args.heads, layers=args.layers,
+        feats, ds.n_items, d=args.dim, heads=args.heads, layers=args.layers,
         dropout=args.dropout, id_dropout=args.id_dropout,
         nbrs=nbrs if args.graph_nbrs > 0 else None, n_graph_nbrs=max(args.graph_nbrs, 1),
     ).to(device)
@@ -105,19 +112,21 @@ def main(argv=None):
                           args.w_graded, args.graded_min_gap, args.rating_weight, args.rating_loss)
     sampler = TrainSampler(ds, nbrs, max_context=args.max_context, max_targets=args.max_targets,
                            target_frac=args.target_frac, n_rand_neg=args.rand_neg,
-                           hard_rank=tuple(args.hard_rank), n_to_read=args.to_read_per_user,
-                           seed=args.seed)
+                           hard_rank=tuple(args.hard_rank),
+                           n_to_read=args.to_read_per_user if args.to_read else 0, seed=args.seed)
 
     train_users = sampler.trainable_users()
     if args.max_users:
         train_users = rng.choice(train_users, min(args.max_users, len(train_users)), replace=False)
     all_users = np.arange(ds.n_users)
-    val_users = all_users if not args.eval_users else rng.choice(all_users, args.eval_users, replace=False)
-    if args.max_users:   # debug runs: evaluate the users we trained on
+    val_users = None if not args.eval_users else rng.choice(all_users, args.eval_users, replace=False)
+    test_users = None if not args.test_users else rng.choice(all_users, args.test_users, replace=False)
+    if args.max_users:   # debug runs: evaluate users we trained on
         val_users = train_users[:args.eval_users or None]
+        test_users = train_users[:args.test_users or None]
 
-    baselines = {**constant_baselines(ds, ds.val), **popularity_recall(ds, ds.val, val_users)}
-    print("val baselines:", json.dumps(baselines))
+    val_base = baselines(ds, "val", val_users)
+    print("val baselines:", json.dumps(val_base))
 
     steps_per_epoch = int(np.ceil(len(train_users) / args.batch_size))
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, pct_start=0.05,
@@ -144,28 +153,24 @@ def main(argv=None):
                 print(f"ep {epoch} step {n}/{steps_per_epoch} hard={sampler.n_hard} "
                       + " ".join(f"{k}={v / n:.4f}" for k, v in running.items())
                       + f" ({time.time() - t_ep:.0f}s)", flush=True)
-        val = evaluate(model, ds, ds.val, val_users, device=device, max_context=args.max_context,
-                       pos_threshold=args.pos_threshold)
-        rec = {"epoch": epoch, **{f"train_{k}": v / steps_per_epoch for k, v in running.items()},
-               **{f"val_{k}": v for k, v in val.items()}}
-        history.append(rec)
+        val = evaluate(model, ds, "val", val_users, device=device, max_context=args.max_context)
+        history.append({"epoch": epoch, **{f"train_{k}": v / steps_per_epoch for k, v in running.items()},
+                        **{f"val_{k}": v for k, v in val.items()}})
         print("val:", json.dumps(val), flush=True)
-        if val["recall@20"] > best:
+        if val["recall@20"] > best:      # model selection on val Recall@20 (team invariant)
             best = val["recall@20"]
-            torch.save({"model": model.state_dict(), "args": vars(args), "epoch": epoch}, best_path)
+            torch.save({"model": model.state_dict(), "args": vars(args), "epoch": epoch,
+                        "fingerprint": ds.fingerprint}, best_path)
 
     model.load_state_dict(torch.load(best_path, map_location=device)["model"])
-    test_users = all_users if not args.test_users else rng.choice(all_users, args.test_users, replace=False)
-    if args.max_users:
-        test_users = train_users[:args.test_users or None]
-    test = evaluate(model, ds, ds.test, test_users, device=device, max_context=args.max_context,
-                    pos_threshold=args.pos_threshold)
-    test_base = {**constant_baselines(ds, ds.test), **popularity_recall(ds, ds.test, test_users)}
+    test = evaluate(model, ds, "test", test_users, device=device, max_context=args.max_context)
+    test_base = baselines(ds, "test", test_users)
     print("test:", json.dumps(test))
     print("test baselines:", json.dumps(test_base))
     (out / "results.json").write_text(json.dumps(
-        {"args": vars(args), "loss_config": asdict(loss_cfg), "history": history,
-         "val_baselines": baselines, "test": test, "test_baselines": test_base}, indent=2))
+        {"expert": "graph_transformer", "fingerprint": ds.fingerprint, "args": vars(args),
+         "loss_config": asdict(loss_cfg), "history": history, "val_baselines": val_base,
+         "test": test, "test_baselines": test_base}, indent=2))
     print(f"wrote {out / 'results.json'}")
 
 

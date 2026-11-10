@@ -1,11 +1,7 @@
-"""Loading goodbooks-10k, building leak-free splits, and per-user histories.
+"""Graph-transformer view of the SHARED processed data (common/process.py).
 
-Conventions
------------
-* Internal ids are 0-based: ``user = user_id - 1`` and ``book = book_id - 1``.
-* ``ratings.csv`` is sorted by time across *all* users (rows are interleaved),
-  so the row index works as a global clock. A stable sort by user therefore keeps
-  each user's ratings in time order.
+This module no longer builds its own split. It wraps common.process.load_processed() into per-user
+time-ordered histories for the sampler. Ids are the processed indices used by every expert.
 """
 from __future__ import annotations
 
@@ -13,104 +9,27 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import scipy.sparse as sp
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-SPLIT_DIR = Path(__file__).resolve().parent.parent / "splits"
-N_BOOKS = 10_000
-N_USERS = 53_424
-
-TRAIN, VAL, TEST = 0, 1, 2
-
-
-@dataclass
-class Ratings:
-    user: np.ndarray    # int64 [E], 0-based
-    book: np.ndarray    # int64 [E], 0-based
-    rating: np.ndarray  # int64 [E], 1..5
-    time: np.ndarray    # int64 [E], row index in ratings.csv (global time order)
-    n_users: int
-    n_books: int
-
-
-def load_ratings(data_dir: Path | str = DATA_DIR) -> Ratings:
-    df = pd.read_csv(Path(data_dir) / "ratings.csv")
-    return Ratings(
-        user=df.user_id.to_numpy(np.int64) - 1,
-        book=df.book_id.to_numpy(np.int64) - 1,
-        rating=df.rating.to_numpy(np.int64),
-        time=np.arange(len(df), dtype=np.int64),
-        n_users=N_USERS,
-        n_books=N_BOOKS,
-    )
-
-
-def load_to_read(data_dir: Path | str = DATA_DIR) -> tuple[np.ndarray, np.ndarray]:
-    df = pd.read_csv(Path(data_dir) / "to_read.csv")
-    return df.user_id.to_numpy(np.int64) - 1, df.book_id.to_numpy(np.int64) - 1
-
-
-def make_split(r: Ratings, mode: str = "temporal", val_frac: float = 0.1,
-               test_frac: float = 0.1, seed: int = 0) -> np.ndarray:
-    """Return an int8 label (TRAIN/VAL/TEST) for every rating edge.
-
-    temporal : for each user, the last ``test_frac`` of their ratings go to test
-               and the ``val_frac`` before those go to val ("predict what they
-               rate next"). Every user keeps at least one train edge.
-    random   : a global random edge split (80/10/10 by default).
-    """
-    split = np.zeros(len(r.user), dtype=np.int8)
-    if mode == "random":
-        rng = np.random.default_rng(seed)
-        x = rng.random(len(r.user))
-        split[x < test_frac] = TEST
-        split[(x >= test_frac) & (x < test_frac + val_frac)] = VAL
-        return split
-    if mode != "temporal":
-        raise ValueError(f"unknown split mode {mode!r}")
-
-    order = np.lexsort((r.time, r.user))              # by user, then time
-    users_sorted = r.user[order]
-    counts = np.bincount(r.user, minlength=r.n_users)
-    starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
-    rank = np.arange(len(order)) - starts[users_sorted]   # 0..n_u-1 within user
-    n = counts[users_sorted]
-    n_test = np.maximum(1, np.round(n * test_frac)).astype(np.int64)
-    n_test = np.minimum(n_test, n - 1)                    # keep >= 1 train edge
-    n_val = np.maximum(1, np.round(n * val_frac)).astype(np.int64)
-    n_val = np.minimum(n_val, n - n_test - 1)
-    lab = np.full(len(order), TRAIN, dtype=np.int8)
-    lab[rank >= n - n_test] = TEST
-    lab[(rank >= n - n_test - n_val) & (rank < n - n_test)] = VAL
-    split[order] = lab
-    return split
-
-
-def load_or_make_split(r: Ratings, mode: str = "temporal", seed: int = 0,
-                       split_dir: Path | str = SPLIT_DIR, **kw) -> np.ndarray:
-    """Freeze splits on disk so every teammate and model sees identical data."""
-    p = Path(split_dir) / f"{mode}_seed{seed}.npz"
-    if p.exists():
-        s = np.load(p)["split"]
-        assert len(s) == len(r.user), "cached split does not match ratings.csv"
-        return s
-    s = make_split(r, mode=mode, seed=seed, **kw)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(p, split=s)
-    return s
+from common.process import DEFAULT_PROCESSED, load_processed
 
 
 class UserHistory:
-    """CSR store of each user's edges, in time order. ``get(u) -> (books, ratings, times)``."""
+    """CSR store of each user's edges, in time order. ``get(u) -> (items, ratings, times)``."""
 
-    def __init__(self, user, book, rating, time, n_users):
+    def __init__(self, user, item, rating, time, n_users):
+        user = np.asarray(user, np.int64)
         order = np.lexsort((time, user))
-        self.book = book[order]
-        self.rating = rating[order]
-        self.time = time[order]
+        self.book = np.asarray(item, np.int64)[order]
+        self.rating = np.asarray(rating, np.int64)[order]
+        self.time = np.asarray(time, np.int64)[order]
         counts = np.bincount(user, minlength=n_users)
         self.indptr = np.concatenate([[0], np.cumsum(counts)])
         self.n_users = n_users
+
+    @classmethod
+    def from_rows(cls, rows: dict, n_users: int) -> "UserHistory":
+        return cls(rows["user"], rows["item"], rows["rating"], rows["t"], n_users)
 
     def get(self, u: int):
         a, b = self.indptr[u], self.indptr[u + 1]
@@ -124,14 +43,14 @@ class UserHistory:
 
 
 class PairSet:
-    """Vectorised membership test for (user, book) pairs."""
+    """Vectorised membership test for (user, item) pairs."""
 
-    def __init__(self, user, book, n_books):
-        self.n_books = n_books
-        self.keys = np.unique(np.asarray(user, np.int64) * n_books + np.asarray(book, np.int64))
+    def __init__(self, user, item, n_items):
+        self.n_items = n_items
+        self.keys = np.unique(np.asarray(user, np.int64) * n_items + np.asarray(item, np.int64))
 
-    def contains(self, user, book) -> np.ndarray:
-        k = np.asarray(user, dtype=np.int64) * self.n_books + np.asarray(book, dtype=np.int64)
+    def contains(self, user, item) -> np.ndarray:
+        k = np.asarray(user, dtype=np.int64) * self.n_items + np.asarray(item, dtype=np.int64)
         if len(self.keys) == 0:
             return np.zeros(k.shape, dtype=bool)
         idx = np.minimum(np.searchsorted(self.keys, k), len(self.keys) - 1)
@@ -140,46 +59,48 @@ class PairSet:
 
 @dataclass
 class Dataset:
-    ratings: Ratings
-    split: np.ndarray
-    train: UserHistory
-    val: UserHistory
-    test: UserHistory
-    to_read: UserHistory | None   # leak-filtered "to read" marks (rating field unused)
-    known: PairSet                # train ratings ∪ to_read: never sampled as negatives
+    n_users: int
+    n_items: int
+    positive_threshold: int
+    fingerprint: str
+    train: UserHistory            # ALL train ratings (any stars): the only model input
+    val: UserHistory              # all held-out val ratings: rating metrics only
+    test: UserHistory             # all held-out test ratings: rating metrics only
+    targets: dict[str, sp.csr_matrix]   # "val"/"test": warm positives (shared ground truth)
+    exclude: dict[str, sp.csr_matrix]   # "val": train rated; "test": train + val rated (any stars)
+    known: PairSet                # never sampled as negatives: train-rated (+ to_read if used)
+    to_read: UserHistory | None = None
+    train_pos: sp.csr_matrix | None = None   # positive train edges (for the popularity baseline)
 
     @property
-    def n_users(self):
-        return self.ratings.n_users
+    def n_books(self) -> int:     # alias used by the sampler / model
+        return self.n_items
 
-    @property
-    def n_books(self):
-        return self.ratings.n_books
+    def history(self, split: str) -> UserHistory:
+        return {"val": self.val, "test": self.test}[split]
 
 
-def build_dataset(r: Ratings, split: np.ndarray,
-                  to_read: tuple[np.ndarray, np.ndarray] | None = None) -> Dataset:
-    def hist(mask):
-        return UserHistory(r.user[mask], r.book[mask], r.rating[mask], r.time[mask], r.n_users)
-
-    tr = split == TRAIN
-    tr_user, tr_book = r.user[tr], r.book[tr]
-    tr_read = None
-    known_user, known_book = tr_user, tr_book
-    if to_read is not None:
-        tu, tb = to_read
-        # Drop "to read" marks on books whose rating is held out (a leak: it hints the
-        # user knows the book) and on books already rated in train (no new signal).
-        held = PairSet(r.user[~tr], r.book[~tr], r.n_books)
-        rated_tr = PairSet(tr_user, tr_book, r.n_books)
-        keep = ~held.contains(tu, tb) & ~rated_tr.contains(tu, tb)
-        tu, tb = tu[keep], tb[keep]
-        tr_read = UserHistory(tu, tb, np.zeros_like(tb), np.arange(len(tb)), r.n_users)
-        known_user = np.concatenate([tr_user, tu])
-        known_book = np.concatenate([tr_book, tb])
-
+def from_processed(data: dict, use_to_read: bool = False) -> Dataset:
+    n_u, n_i = data["n_users"], data["n_items"]
+    tr = data["train_all"]
+    to_read, known_u, known_i = None, tr["user"], tr["item"]
+    if use_to_read:   # ablation only: the shared protocol does not use to_read as positives
+        rd = data["to_read"]
+        to_read = UserHistory(rd["user"], rd["item"], np.zeros_like(rd["item"]),
+                              np.arange(len(rd["item"])), n_u)
+        known_u = np.concatenate([known_u, rd["user"]])
+        known_i = np.concatenate([known_i, rd["item"]])
     return Dataset(
-        ratings=r, split=split, train=hist(tr), val=hist(split == VAL),
-        test=hist(split == TEST), to_read=tr_read,
-        known=PairSet(known_user, known_book, r.n_books),
+        n_users=n_u, n_items=n_i, positive_threshold=data["positive_threshold"],
+        fingerprint=data["fingerprint"],
+        train=UserHistory.from_rows(tr, n_u),
+        val=UserHistory.from_rows(data["val_rows"], n_u),
+        test=UserHistory.from_rows(data["test_rows"], n_u),
+        targets={"val": data["val"], "test": data["test"]},
+        exclude={"val": data["seen_before_val"], "test": data["seen_before_test"]},
+        known=PairSet(known_u, known_i, n_i), to_read=to_read, train_pos=data["train"],
     )
+
+
+def load_dataset(processed_dir: str | Path = DEFAULT_PROCESSED, use_to_read: bool = False) -> Dataset:
+    return from_processed(load_processed(processed_dir, with_to_read=use_to_read), use_to_read)

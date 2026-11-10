@@ -4,7 +4,8 @@
 
 L_BPR    personalised BPR (CS224W lec. 11): for each user, every positive should
          outscore every negative. Per-user mean, then mean over users.
-           positives: target edges rated >= pos_threshold (4-5 stars) and to-read books
+           positives: target edges rated >= pos_threshold (4-5 stars); to-read books only in
+                      the --to-read ablation (not part of the shared protocol)
            negatives: random unrated books, PinSAGE-style hard negatives, and
                       target edges rated <= dislike_threshold (1-2 stars, weight w_dislike):
                       read-and-disliked books are the hardest, most trustworthy negatives.
