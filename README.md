@@ -62,3 +62,15 @@ python -m bookrec.train_graph_transformer --max-users 4000 --epochs 2 --eval-use
 python -m bookrec.train_graph_transformer --split random                      # random 80/10/10
 ```
 Results go to `runs/<name>/results.json` (args, per-epoch history, test metrics, baselines).
+
+### Running on Colab / a GPU cluster
+
+```bash
+git clone -b derek/graph-transformer https://github.com/Bkwan27/BookRecommendation.git
+cd BookRecommendation && pip install -r requirements.txt
+python -m bookrec.train_graph_transformer --device cuda --out runs/gt_full
+```
+- `--device auto` (the default) picks CUDA, then MPS, then CPU.
+- The first run writes `splits/temporal_seed0.npz` and the co-rating neighbour cache (~10s). Copy `splits/` between machines so everyone uses identical splits.
+- Batch sampling runs on the CPU in the main process. If the GPU is underused, raise `--batch-size` (e.g. 1024, and scale `--lr` up).
+- `--eval-users 0 --test-users 0` evaluates every user (the default tests on all users and validates on 2,000).
