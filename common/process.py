@@ -3,8 +3,12 @@
 """
 goodbooks-10k preprocessing for graph recommenders (LightGCN, PinSage) and other models.
 
-    python preprocess_goodbooks.py --download                  # fetch the raw CSVs, then preprocess
-    python preprocess_goodbooks.py --raw-dir data/raw --out-dir data/processed --split global_temporal
+    python -m common.process                                   # data/ -> data/processed/ (shared default)
+    python -m common.process --download --raw-dir data/raw     # fetch the raw CSVs first
+    python -m common.process --split global_temporal --out-dir data/processed_global
+
+Every model (LightGCN, PinSage, graph transformer, MoE) must load the SAME output through
+load_processed() and check its "fingerprint" (see the README's "Invariants" section).
 
 Requires Python 3.9+, numpy, pandas, scipy. No deep-learning framework is needed: every output is a
 plain numpy / scipy / CSV file that loads directly into PyTorch, PyG or DGL.
@@ -88,8 +92,8 @@ SPLIT_CODES = {"train": 0, "val": 1, "test": 2}  # int8 codes stored in interact
 # ==============================================================================================
 @dataclass
 class Config:
-    raw_dir: str = "data/raw"
-    out_dir: str = "data/processed"
+    raw_dir: str = "data"             # the repo ships the raw CSVs in data/
+    out_dir: str = "data/processed"   # gitignored; regenerate with `python -m common.process` (~15s)
     download: bool = False
 
     # Implicit feedback. LightGCN (BPR loss) and PinSage (max-margin loss) learn from positive
@@ -131,9 +135,11 @@ class Config:
     min_books_per_language: int = 10  # the 14 rarest language codes cover 1-7 books each (42 books in total)
     # Goodreads' own counters (ratings count, star histogram, review count) are strong popularity
     # signals, but they were scraped at the end of the timeline: they summarise ratings that happen
-    # after any training cut-off, including the test users' ratings. With split="user_temporal" the
-    # effect is small; for a strictly leakage-free evaluation (split="global_temporal") turn this off.
-    use_popularity_features: bool = True
+    # after any training cut-off, including the test users' ratings, and frac_k_star is essentially
+    # the book's average rating, i.e. an aggregate of the held-out labels. OFF by default (team
+    # invariant): every expert must see the same leakage-free inputs. Turn on only for an explicitly
+    # labelled ablation.
+    use_popularity_features: bool = False
 
     def __post_init__(self) -> None:
         if self.split not in SPLITS:
@@ -748,6 +754,9 @@ def main(cfg: Config) -> None:
                   "n_ratings": np.bincount(u, minlength=n_users),
                   "n_train_pos": np.bincount(u[train_pos], minlength=n_users)}).to_csv(out / "users.csv", index=False)
     np.savez(out / "to_read.npz", **to_read)
+    stats["fingerprint"] = fingerprint(df["user"].to_numpy(), df["item"].to_numpy(),
+                                       df["rating"].to_numpy(), split, is_target)
+    log(f"fingerprint {stats['fingerprint']} (record it in every results.json)")
     stats["seconds"] = round(time.time() - _T0, 1)
     (out / "stats.json").write_text(json.dumps(stats, indent=2))
     log(f"done, outputs in {out.resolve()}")
@@ -756,35 +765,87 @@ def main(cfg: Config) -> None:
 # ==============================================================================================
 # Loading helper for training / evaluation scripts
 # ==============================================================================================
-def load_processed(out_dir: str | Path) -> dict:
-    """Load the processed data as [n_users x n_items] CSR matrices that encode the evaluation protocol.
+def fingerprint(user: np.ndarray, item: np.ndarray, rating: np.ndarray, split: np.ndarray,
+                is_target: np.ndarray) -> str:
+    """Short hash of the exact interactions + split. Two experts can only be compared, or combined by
+    the MoE router, if their results.json files report the same fingerprint."""
+    import hashlib
+    h = hashlib.sha256()
+    for a in (user, item, rating, split, is_target):
+        h.update(np.ascontiguousarray(a).tobytes())
+    return h.hexdigest()[:12]
 
-    train              positive train interactions -> graph edges / BPR positives for every model
-    val, test          ground truth: warm positives of the held-out periods
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_PROCESSED = REPO_ROOT / "data" / "processed"
+
+
+def load_processed(out_dir: str | Path = DEFAULT_PROCESSED, with_to_read: bool = False) -> dict:
+    """Load the processed data. Every expert uses this; nothing else defines the split.
+
+    n_users, n_items   sizes; ids are the processed indices (users.csv / books.csv map back to raw ids)
+    train              CSR [U x I] of POSITIVE train interactions -> graph edges / BPR positives
+    train_edges        the same positive train edges as arrays (user, item, rating, t)
+    train_all          ALL train ratings, any stars, as arrays (user, item, rating, t), sorted by user
+                       then time. For models that use star values (graph transformer: 1-2 stars as
+                       negatives, rating head, rated-history tokens). Never use val/test rows as input.
+    val, test          CSR ground truth: warm positives of the held-out periods (is_target)
+    val_rows,          ALL held-out ratings of that split, any stars, as arrays (user, item, rating, t),
+    test_rows          for rating metrics (RMSE / accuracy). Not inputs.
     seen_before_val    everything rated in train (any stars): mask these out when ranking for val
     seen_before_test   everything rated in train or val: mask these out when ranking for test
-    train_edges        the same positive train edges as arrays (user, item, rating, t), for code that
-                       needs time, e.g. PinSage evaluation that queries with a user's latest book
+    positive_threshold the star threshold the split was built with
+    fingerprint        hash of the interactions + split (store it in every results.json)
+    to_read            (with_to_read=True) optional "wants to read" edges; see process_to_read() for
+                       why they must not be used as positives
     Masks use all ratings, not just positives: a book the user already rated (even 2 stars) can never
     be a hit, and recommending it again would be a wasted slot in a real system.
-    Typical protocol: train on "train", early-stop / tune on "val", report "test" once at the end.
+    Protocol: train on "train", early-stop / tune on "val", report "test" once at the end. The input
+    history at evaluation time is train only, for val and for test alike.
     """
     out = Path(out_dir)
+    if not (out / "interactions.npz").exists():
+        raise FileNotFoundError(f"{out} has no processed data; run `python -m common.process` first")
     z = np.load(out / "interactions.npz")
     stats = json.loads((out / "stats.json").read_text())
     n_u, n_i = stats["after_kcore"]["users"], stats["after_kcore"]["books"]
     thr = stats["config"]["positive_threshold"]
-    u, i, s, tgt = z["user"], z["item"], z["split"], z["is_target"]
+    u, i, s, tgt, r, t = z["user"], z["item"], z["split"], z["is_target"], z["rating"], z["t"]
+    fp = fingerprint(u, i, r, s, tgt)
+    if "fingerprint" in stats and stats["fingerprint"] != fp:
+        raise ValueError(f"{out}/interactions.npz does not match stats.json; re-run common.process")
 
     def csr(mask: np.ndarray) -> sp.csr_matrix:
         return sp.csr_matrix((np.ones(int(mask.sum()), np.float32), (u[mask], i[mask])), shape=(n_u, n_i))
 
-    train_pos = (s == 0) & (z["rating"] >= thr)
-    return {"n_users": n_u, "n_items": n_i,
-            "train": csr(train_pos),
-            "train_edges": {k: z[k][train_pos] for k in ("user", "item", "rating", "t")},
+    def rows(mask: np.ndarray) -> dict[str, np.ndarray]:
+        return {"user": u[mask].astype(np.int64), "item": i[mask].astype(np.int64),
+                "rating": r[mask].astype(np.int64), "t": t[mask].astype(np.int64)}
+
+    train_pos = (s == 0) & (r >= thr)
+    data = {"n_users": n_u, "n_items": n_i, "positive_threshold": thr, "fingerprint": fp,
+            "config": stats["config"],
+            "train": csr(train_pos), "train_edges": rows(train_pos), "train_all": rows(s == 0),
             "val": csr((s == 1) & tgt), "test": csr((s == 2) & tgt),
+            "val_rows": rows(s == 1), "test_rows": rows(s == 2),
             "seen_before_val": csr(s == 0), "seen_before_test": csr(s <= 1)}
+    if with_to_read:
+        tr = np.load(out / "to_read.npz")
+        data["to_read"] = {"user": tr["user"].astype(np.int64), "item": tr["item"].astype(np.int64)}
+    return data
+
+
+def load_item_features(out_dir: str | Path = DEFAULT_PROCESSED) -> dict:
+    """Book features for feature-based experts (PinSage, graph transformer), row i = item i.
+
+    tags      scipy CSR [n_items x n_tags], weights in (0, 1]   (vocab: tag_vocab.csv)
+    numeric   float32 [n_items x k], z-scored (names in numeric_names; no popularity columns by default)
+    author, series, language, year_bucket   int64 codes, 0 = rare/unknown (vocab_<name> for labels)
+    """
+    out = Path(out_dir)
+    f = dict(np.load(out / "item_features.npz"))
+    f["tags"] = sp.load_npz(out / "item_tags.npz").tocsr()
+    return f
 
 
 def parse_args() -> Config:

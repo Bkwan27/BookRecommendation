@@ -7,3 +7,4 @@ __pycache__/
 checkpoints/
 splits/
 runs/
+data/processed/
