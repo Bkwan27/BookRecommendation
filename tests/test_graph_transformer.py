@@ -3,12 +3,12 @@ import numpy as np
 import pytest
 import torch
 
-from bookrec.data import TEST, TRAIN, VAL, PairSet, Ratings, build_dataset, make_split
-from bookrec.evaluate import evaluate
-from bookrec.features import BookFeatures
-from bookrec.losses import LossConfig, bpr_loss, graded_loss, objective
-from bookrec.models.graph_transformer import GraphTransformerRecommender
-from bookrec.sampling import TrainSampler, corated_neighbors
+from graphtransformer.data import TEST, TRAIN, VAL, PairSet, Ratings, build_dataset, make_split
+from graphtransformer.evaluate import evaluate
+from graphtransformer.features import BookFeatures
+from graphtransformer.losses import LossConfig, bpr_loss, graded_loss, objective
+from graphtransformer.models.graph_transformer import GraphTransformerRecommender
+from graphtransformer.sampling import TrainSampler, corated_neighbors
 
 N_USERS, N_BOOKS = 40, 60
 
