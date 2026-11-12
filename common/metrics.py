@@ -73,7 +73,9 @@ def rating_metrics(pred: np.ndarray, rating: np.ndarray, pred_class: np.ndarray 
 def popularity_score_fn(data: dict, device="cpu") -> Callable[[np.ndarray], torch.Tensor]:
     """MostPop baseline: score = number of positive TRAIN interactions (never Goodreads' counters)."""
     pop = torch.as_tensor(np.asarray(data["train"].sum(0)).ravel(), dtype=torch.float32, device=device)
-    return lambda b: pop.expand(len(b), -1)
+    # clone(): callers such as lightgcn/metrics.evaluate write -inf into the result in place, which
+    # would otherwise corrupt the shared popularity vector through the broadcast view.
+    return lambda b: pop.expand(len(b), -1).clone()
 
 
 def constant_rating_baselines(data: dict, split: str) -> dict:

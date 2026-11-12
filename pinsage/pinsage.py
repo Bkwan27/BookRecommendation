@@ -36,7 +36,7 @@ SELECT_BY = "ndcg@20"
 @dataclass
 class Config:
     data: str = str(DEFAULT_PROCESSED)
-    out: str = str(Path(__file__).resolve().parent / "out")
+    out: str = str(Path(__file__).resolve().parent.parent / "runs" / "pinsage")
     num_walks: int = 200       # random walks started from each book
     walk_hops: int = 3         # max book -> reader -> book hops per walk
     restart_prob: float = 0.5  # chance to stop after each hop

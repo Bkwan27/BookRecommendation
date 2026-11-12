@@ -1,13 +1,13 @@
 """
-Loads the preprocessed data split made by process.py for LightGCN.
+Loads the preprocessed data split made by common/process.py for LightGCN.
 
-All the cleaning, k-core filtering, splitting and masking happens in process.py,
+All the cleaning, k-core filtering, splitting and masking happens in common/process.py,
 so every model gets evaluated on the same users, books and ground truth.
 To build the data once:
 
-    python process.py --raw-dir data --out-dir data/processed
+    python -m common.process
 
-How the split works (see process.load_processed):
+How the split works (see common.process.load_processed):
   - each user's ratings are split 80/10/10 by time (using all ratings)
   - graph edges / BPR positives are train ratings with >= 4 stars
   - val/test ground truth are warm held-out ratings with >= 4 stars
@@ -32,7 +32,7 @@ PROC_DIR = os.path.join(DATA_DIR, "processed")
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from process import load_processed  # noqa: E402
+from common.process import load_processed  # noqa: E402
 
 
 @dataclass
@@ -52,13 +52,14 @@ class Dataset:
 
     path: str
     config: dict
+    fingerprint: str   # split hash from common.process; recorded in results.json
 
 
 def load(path: str = PROC_DIR) -> Dataset:
     interactions_file = os.path.join(path, "interactions.npz")
     if not os.path.exists(interactions_file):
         raise FileNotFoundError(
-            f"{path} has no processed data; run: python process.py --raw-dir data --out-dir {path}"
+            f"{path} has no processed data; run: python -m common.process --out-dir {path}"
         )
 
     processed = load_processed(path)
@@ -82,6 +83,7 @@ def load(path: str = PROC_DIR) -> Dataset:
         test_exclude=processed["seen_before_test"],
         path=path,
         config=config,
+        fingerprint=processed["fingerprint"],
     )
     return dataset
 
