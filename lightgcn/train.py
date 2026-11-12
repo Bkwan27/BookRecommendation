@@ -1,7 +1,7 @@
 """
 Trains LightGCN with BPR loss for top-K book recommendation.
 
-Uses the shared split from process.py (see lightgcn/data.py). We pick the best
+Uses the shared split from common/process.py (see lightgcn/data.py). We pick the best
 model / early stop using validation Recall@20 (books rated in train are masked),
 and then evaluate that checkpoint on test (books rated in train or val are masked).
 
@@ -77,7 +77,7 @@ def make_scorer(model):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--data_dir", type=str, default=data.PROC_DIR, help="output dir of process.py")
+    parser.add_argument("--data_dir", type=str, default=data.PROC_DIR, help="output dir of `python -m common.process`")
     parser.add_argument("--dim", type=int, default=64)
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -129,7 +129,7 @@ def main():
         print("val ", fmt(res["val"]))
         print("test", fmt(res["test"]))
 
-        output = {"args": vars(args), "data_config": ds.config}
+        output = {"model": "popularity", "fingerprint": ds.fingerprint, "args": vars(args), "data_config": ds.config}
         output["val"] = res["val"]
         output["test"] = res["test"]
         save_json(output, results_path)
@@ -223,6 +223,8 @@ def main():
     print(f"test {fmt(test)}")
 
     output = {
+        "model": "lightgcn",
+        "fingerprint": ds.fingerprint,
         "args": vars(args),
         "data_config": ds.config,
         "best_epoch": best_epoch,
