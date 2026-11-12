@@ -5,6 +5,6 @@ __pycache__/
 .DS_Store
 *.pt
 checkpoints/
-splits/
-runs/
+.venv-gpu/
 data/processed/
+runs/slurm-*.out
