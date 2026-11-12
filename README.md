@@ -25,13 +25,14 @@ Notes:
 
 Implicit-feedback formulation: ratings ≥ 4 are positive interactions (`--min_rating`). LightGCN (He et al., 2020) is trained with BPR loss and uniform negative sampling, and evaluated by full ranking over all 10k books.
 
-**Split** (`lightgcn/data.py`, cached to `data/processed/`): since `ratings.csv` is time-ordered, each user's positives are split chronologically: first 80% train, next 10% validation, last 10% test. Users with ≥3 positives get at least 1 val and 1 test item. Result: 53,406 users, 10,000 books, 3.35M train / 388K val / 388K test edges.
+**Data**: the shared preprocessing in `process.py` (run once: `python process.py --raw-dir data --out-dir data/processed`), loaded via `process.load_processed`. It applies a 10-core filter, then splits each user's ratings (all stars) chronologically 80/10/10. Graph edges are the >=4 star train ratings, and val/test ground truth are warm >=4 star held-out ratings. Result: 53,289 users, 9,996 books, 3.30M train edges, 407K val / 414K test targets.
 
-**Evaluation** (`lightgcn/metrics.py`): Recall/Precision/NDCG/HitRate @ {10, 20, 50}. Val masks train items; test masks train + val items. Early stopping on val Recall@20; the best checkpoint is scored on test.
+**Evaluation** (`lightgcn/metrics.py`): Recall/Precision/NDCG/HitRate @ {10, 20, 50}. Val masks every book rated in train; test masks every book rated in train or val (any stars). Early stopping on val Recall@20; the best checkpoint is scored on test.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu && .venv/bin/pip install numpy pandas scipy
-.venv/bin/python -m lightgcn.data                   # build split + print stats
+.venv/bin/python process.py --raw-dir data --out-dir data/processed   # shared split
+.venv/bin/python -m lightgcn.data                   # print split stats
 .venv/bin/python -m lightgcn.train --popularity     # most-popular baseline
 .venv/bin/python -m lightgcn.train --layers 0       # MF-BPR baseline (no propagation)
 # GPU (FarmShare `gpu` partition, L40S); needs a CUDA torch venv in .venv-gpu (cu126 wheel)
@@ -42,4 +43,4 @@ CPU training is too slow to be practical (more than 15 minutes per epoch), so us
 
 | Model | val R@20 | val N@20 | test R@20 | test N@20 |
 |---|---|---|---|---|
-| Popularity | 0.0459 | 0.0356 | 0.0373 | 0.0284 |
+| Popularity | 0.0483 | 0.0383 | 0.0399 | 0.0313 |

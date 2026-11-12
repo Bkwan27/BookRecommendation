@@ -1,102 +1,107 @@
-"""Implicit-feedback data + per-user chronological train/val/test split for top-K recommendation.
+"""
+Loads the preprocessed data split made by process.py for LightGCN.
 
-ratings.csv is sorted by time (no timestamps), so file order is used as the time axis:
-for every user, the earliest 80% of their positive interactions go to train, the next 10% to
-validation, and the latest 10% to test (a "leave-latest-out" style split, no future leakage).
+All the cleaning, k-core filtering, splitting and masking happens in process.py,
+so every model gets evaluated on the same users, books and ground truth.
+To build the data once:
+
+    python process.py --raw-dir data --out-dir data/processed
+
+How the split works (see process.load_processed):
+  - each user's ratings are split 80/10/10 by time (using all ratings)
+  - graph edges / BPR positives are train ratings with >= 4 stars
+  - val/test ground truth are warm held-out ratings with >= 4 stars
+  - for val we mask everything the user rated in train; for test we mask
+    everything rated in train or val (any star value)
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import sys
 from dataclasses import dataclass
 
 import numpy as np
-import pandas as pd
 import scipy.sparse as sp
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(ROOT, "data")
 PROC_DIR = os.path.join(DATA_DIR, "processed")
 
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
-def split_dir(min_rating: int, val_frac: float, test_frac: float) -> str:
-    return os.path.join(PROC_DIR, f"implicit_r{min_rating}_v{val_frac}_t{test_frac}")
-
-
-def make_split(min_rating: int = 4, val_frac: float = 0.1, test_frac: float = 0.1) -> str:
-    """Build train/val/test CSVs (user_idx, item_idx, rating) with contiguous 0-based ids."""
-    out = split_dir(min_rating, val_frac, test_frac)
-    if all(os.path.exists(os.path.join(out, f"{s}.csv")) for s in ("train", "val", "test")):
-        return out
-    os.makedirs(out, exist_ok=True)
-
-    df = pd.read_csv(os.path.join(DATA_DIR, "ratings.csv"))
-    df["order"] = np.arange(len(df))  # file order == time order
-    df = df[df["rating"] >= min_rating].copy()
-
-    # Contiguous ids over users/books that have at least one positive.
-    df["user_idx"], users = pd.factorize(df["user_id"], sort=True)
-    df["item_idx"], items = pd.factorize(df["book_id"], sort=True)
-    pd.DataFrame({"user_idx": np.arange(len(users)), "user_id": users}).to_csv(
-        os.path.join(out, "user_map.csv"), index=False)
-    pd.DataFrame({"item_idx": np.arange(len(items)), "book_id": items}).to_csv(
-        os.path.join(out, "item_map.csv"), index=False)
-
-    df = df.sort_values(["user_idx", "order"], kind="stable")
-    rank = df.groupby("user_idx").cumcount().to_numpy()
-    n = df.groupby("user_idx")["user_idx"].transform("size").to_numpy()
-    n_test = np.floor(n * test_frac).astype(int)
-    n_val = np.floor(n * val_frac).astype(int)
-    # Users with >=3 positives always get at least one val and one test item.
-    eligible = n >= 3
-    n_test = np.where(eligible, np.maximum(n_test, 1), 0)
-    n_val = np.where(eligible, np.maximum(n_val, 1), 0)
-    n_train = n - n_val - n_test
-
-    split = np.where(rank < n_train, "train", np.where(rank < n_train + n_val, "val", "test"))
-    cols = ["user_idx", "item_idx", "rating"]
-    for s in ("train", "val", "test"):
-        df.loc[split == s, cols].to_csv(os.path.join(out, f"{s}.csv"), index=False)
-    return out
+from process import load_processed  # noqa: E402
 
 
 @dataclass
 class Dataset:
     n_users: int
     n_items: int
-    train: np.ndarray  # (E, 2) int64 [user, item]
-    val: np.ndarray
-    test: np.ndarray
-    train_csr: sp.csr_matrix  # users x items, binary
-    val_csr: sp.csr_matrix
-    test_csr: sp.csr_matrix
+
+    # (num_edges, 2) array of [user, item] positive train edges
+    train: np.ndarray
+
+    # users x items matrices
+    train_csr: sp.csr_matrix     # positive train edges (used for the graph and BPR)
+    val_csr: sp.csr_matrix       # val ground truth
+    test_csr: sp.csr_matrix      # test ground truth
+    val_exclude: sp.csr_matrix   # items to mask for val (rated in train)
+    test_exclude: sp.csr_matrix  # items to mask for test (rated in train or val)
+
     path: str
+    config: dict
 
 
-def load(min_rating: int = 4, val_frac: float = 0.1, test_frac: float = 0.1) -> Dataset:
-    path = make_split(min_rating, val_frac, test_frac)
-    n_users = len(pd.read_csv(os.path.join(path, "user_map.csv")))
-    n_items = len(pd.read_csv(os.path.join(path, "item_map.csv")))
-    arrs, csrs = {}, {}
-    for s in ("train", "val", "test"):
-        e = pd.read_csv(os.path.join(path, f"{s}.csv"), usecols=["user_idx", "item_idx"]).to_numpy(np.int64)
-        arrs[s] = e
-        csrs[s] = sp.csr_matrix((np.ones(len(e), np.float32), (e[:, 0], e[:, 1])), shape=(n_users, n_items))
-    return Dataset(n_users, n_items, arrs["train"], arrs["val"], arrs["test"],
-                   csrs["train"], csrs["val"], csrs["test"], path)
+def load(path: str = PROC_DIR) -> Dataset:
+    interactions_file = os.path.join(path, "interactions.npz")
+    if not os.path.exists(interactions_file):
+        raise FileNotFoundError(
+            f"{path} has no processed data; run: python process.py --raw-dir data --out-dir {path}"
+        )
+
+    processed = load_processed(path)
+
+    train_coo = processed["train"].tocoo()
+    edges = np.stack([train_coo.row, train_coo.col], axis=1)
+    edges = edges.astype(np.int64)
+
+    with open(os.path.join(path, "stats.json")) as f:
+        stats = json.load(f)
+    config = stats["config"]
+
+    dataset = Dataset(
+        n_users=processed["n_users"],
+        n_items=processed["n_items"],
+        train=edges,
+        train_csr=processed["train"],
+        val_csr=processed["val"],
+        test_csr=processed["test"],
+        val_exclude=processed["seen_before_val"],
+        test_exclude=processed["seen_before_test"],
+        path=path,
+        config=config,
+    )
+    return dataset
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--min_rating", type=int, default=4)
-    p.add_argument("--val_frac", type=float, default=0.1)
-    p.add_argument("--test_frac", type=float, default=0.1)
-    a = p.parse_args()
-    d = load(a.min_rating, a.val_frac, a.test_frac)
-    print(f"split dir: {d.path}")
-    print(f"users={d.n_users} items={d.n_items} train={len(d.train)} val={len(d.val)} test={len(d.test)}")
-    print(f"density={len(d.train) / (d.n_users * d.n_items):.4%}")
-    print(f"users with val items={np.diff(d.val_csr.indptr).astype(bool).sum()}, "
-          f"test items={np.diff(d.test_csr.indptr).astype(bool).sum()}")
-    cold = np.setdiff1d(np.unique(d.test[:, 1]), np.unique(d.train[:, 1]))
-    print(f"test items never seen in train: {len(cold)}")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data_dir", default=PROC_DIR)
+    args = parser.parse_args()
+
+    ds = load(args.data_dir)
+
+    n_train = ds.train_csr.nnz
+    n_val = ds.val_csr.nnz
+    n_test = ds.test_csr.nnz
+    density = n_train / (ds.n_users * ds.n_items)
+
+    users_with_val = np.diff(ds.val_csr.indptr).astype(bool).sum()
+    users_with_test = np.diff(ds.test_csr.indptr).astype(bool).sum()
+
+    print(f"data dir: {ds.path}  split={ds.config['split']} positive>={ds.config['positive_threshold']}")
+    print(f"users={ds.n_users} items={ds.n_items} train={n_train} val={n_val} test={n_test}")
+    print(f"density={density:.4%}")
+    print(f"users with val targets={users_with_val}, test targets={users_with_test}")
